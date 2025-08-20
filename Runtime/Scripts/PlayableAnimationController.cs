@@ -14,6 +14,17 @@ namespace LightningAnimation
     [AddComponentMenu("Lightning Animation/Playable Animation Controller")]
     public class PlayableAnimationController : MonoBehaviour
     {
+        #region Enums
+        
+        public enum PlayMode
+        {
+            Single,      // Stop all other animations
+            Additive,    // Play alongside other animations
+            Queue        // Queue after current animation
+        }
+        
+        #endregion
+        
         #region Serialized Fields
         
         [Header("Settings")]
@@ -23,6 +34,13 @@ namespace LightningAnimation
         [SerializeField, Tooltip("Maximum number of animations that can play simultaneously")]
         [Range(1, 8)]
         private int maxConcurrentAnimations = 4;
+        
+        [SerializeField, Tooltip("Stop all animations when none are playing to save performance")]
+        private bool autoOptimizeWhenIdle = true;
+        
+        [Header("Editor Setup")]
+        [SerializeField, Tooltip("Animations to automatically load at startup")]
+        private AnimationClip[] editorAnimations = new AnimationClip[0];
         
         [Header("Debug")]
         [SerializeField, Tooltip("Show debug information in console")]
@@ -36,18 +54,26 @@ namespace LightningAnimation
         private PlayableGraph playableGraph;
         private AnimationMixerPlayable mixerPlayable;
         private Animator animator;
+        private bool graphInitialized = false;
         
         // Animation management
         private Dictionary<string, PlayableAnimationData> animationCache;
         private List<PlayableAnimationData> activeAnimations;
+        private Queue<QueuedAnimation> animationQueue;
         private PlayableAnimationData currentAnimation;
+        
+        // Performance
+        private float lastActiveTime;
+        private bool isGraphPaused = false;
         
         #endregion
         
         #region Events
         
-        public event Action<string> OnAnimationEnd;
         public event Action<string> OnAnimationStart;
+        public event Action<string> OnAnimationEnd;
+        public event Action<string> OnAnimationInterrupted;
+        public event Action<string, int> OnAnimationLoop; // animation name, loop count
         
         #endregion
         
@@ -57,10 +83,12 @@ namespace LightningAnimation
         public int MaxConcurrentAnimations => maxConcurrentAnimations;
         public int ActiveAnimationCount => activeAnimations?.Count ?? 0;
         public int CachedAnimationCount => animationCache?.Count ?? 0;
+        public int QueuedAnimationCount => animationQueue?.Count ?? 0;
+        public bool IsAnyAnimationPlaying => activeAnimations?.Count > 0;
         
         #endregion
         
-        #region Animation Data Class
+        #region Animation Data Classes
         
         private class PlayableAnimationData
         {
@@ -71,10 +99,14 @@ namespace LightningAnimation
             public float currentTime;
             public float weight;
             public float targetWeight;
+            public float speed = 1f;
             public bool isPlaying;
             public bool isPaused;
             public bool isLooping;
+            public int loopCount;
+            public int maxLoops = -1; // -1 = infinite
             public Action onComplete;
+            public Action onInterrupted;
             public int mixerIndex;
             
             // Blending
@@ -87,12 +119,36 @@ namespace LightningAnimation
                 currentTime = 0f;
                 weight = 0f;
                 targetWeight = 1f;
+                speed = 1f;
                 isPlaying = false;
                 isPaused = false;
                 isFadingIn = false;
                 isFadingOut = false;
+                loopCount = 0;
+                maxLoops = -1;
                 onComplete = null;
+                onInterrupted = null;
                 blendSpeed = 5f;
+            }
+            
+            public void Cleanup()
+            {
+                onComplete = null;
+                onInterrupted = null;
+            }
+        }
+        
+        private class QueuedAnimation
+        {
+            public string name;
+            public Action onComplete;
+            public float fadeTime;
+            
+            public QueuedAnimation(string name, Action onComplete, float fadeTime)
+            {
+                this.name = name;
+                this.onComplete = onComplete;
+                this.fadeTime = fadeTime;
             }
         }
         
@@ -105,20 +161,30 @@ namespace LightningAnimation
             animator = GetComponent<Animator>();
             animationCache = new Dictionary<string, PlayableAnimationData>();
             activeAnimations = new List<PlayableAnimationData>();
+            animationQueue = new Queue<QueuedAnimation>();
             
             InitializePlayableGraph();
+            LoadEditorAnimations();
         }
         
         private void Update()
         {
-            if (playableGraph.IsValid())
+            if (!graphInitialized || isGraphPaused) return;
+            
+            if (activeAnimations.Count > 0)
             {
                 UpdateAnimations();
+                lastActiveTime = Time.time;
+            }
+            else if (autoOptimizeWhenIdle && Time.time - lastActiveTime > 0.5f)
+            {
+                PauseGraph();
             }
         }
         
         private void OnDestroy()
         {
+            CleanupAllAnimations();
             CleanupPlayableGraph();
             CleanupEvents();
         }
@@ -140,7 +206,7 @@ namespace LightningAnimation
                 playableGraph = PlayableGraph.Create($"{gameObject.name}_LightningAnimation");
                 playableGraph.SetTimeUpdateMode(DirectorUpdateMode.GameTime);
                 
-                // Create mixer playable
+                // Create mixer playable with proper input count
                 mixerPlayable = AnimationMixerPlayable.Create(playableGraph, maxConcurrentAnimations);
                 
                 // Create output and connect to animator
@@ -149,12 +215,34 @@ namespace LightningAnimation
                 
                 // Start the graph
                 playableGraph.Play();
+                graphInitialized = true;
                 
                 DebugLog("Playable graph initialized successfully");
             }
             catch (Exception e)
             {
-                Debug.LogError($"Failed to initialize Playable Graph: {e.Message}", this);
+                Debug.LogError($"[Lightning Animation] Failed to initialize Playable Graph: {e.Message}", this);
+                graphInitialized = false;
+            }
+        }
+        
+        private void LoadEditorAnimations()
+        {
+            if (editorAnimations == null || editorAnimations.Length == 0) return;
+            
+            int loadedCount = 0;
+            foreach (var clip in editorAnimations)
+            {
+                if (clip != null)
+                {
+                    AddAnimation(clip.name, clip);
+                    loadedCount++;
+                }
+            }
+            
+            if (loadedCount > 0)
+            {
+                DebugLog($"Loaded {loadedCount} editor animations");
             }
         }
         
@@ -163,14 +251,55 @@ namespace LightningAnimation
             if (playableGraph.IsValid())
             {
                 playableGraph.Destroy();
+                graphInitialized = false;
                 DebugLog("Playable graph destroyed");
             }
         }
         
+        private void CleanupAllAnimations()
+        {
+            // Clean up all animation data
+            foreach (var animData in animationCache.Values)
+            {
+                animData.Cleanup();
+                if (animData.clipPlayable.IsValid())
+                {
+                    animData.clipPlayable.Destroy();
+                }
+            }
+            
+            animationCache.Clear();
+            activeAnimations.Clear();
+            animationQueue.Clear();
+            currentAnimation = null;
+        }
+        
         private void CleanupEvents()
         {
-            OnAnimationEnd = null;
             OnAnimationStart = null;
+            OnAnimationEnd = null;
+            OnAnimationInterrupted = null;
+            OnAnimationLoop = null;
+        }
+        
+        private void PauseGraph()
+        {
+            if (graphInitialized && !isGraphPaused)
+            {
+                playableGraph.Stop();
+                isGraphPaused = true;
+                DebugLog("Graph paused for optimization");
+            }
+        }
+        
+        private void ResumeGraph()
+        {
+            if (graphInitialized && isGraphPaused)
+            {
+                playableGraph.Play();
+                isGraphPaused = false;
+                DebugLog("Graph resumed");
+            }
         }
         
         #endregion
@@ -180,25 +309,29 @@ namespace LightningAnimation
         /// <summary>
         /// Add an animation clip to the system for later playback
         /// </summary>
-        /// <param name="name">Unique name for the animation</param>
-        /// <param name="clip">Animation clip to add</param>
         public void AddAnimation(string name, AnimationClip clip)
         {
             if (string.IsNullOrEmpty(name))
             {
-                Debug.LogWarning("Animation name cannot be null or empty!", this);
+                Debug.LogWarning("[Lightning Animation] Animation name cannot be null or empty!", this);
                 return;
             }
             
             if (clip == null)
             {
-                Debug.LogWarning($"Animation clip for '{name}' is null!", this);
+                Debug.LogWarning($"[Lightning Animation] Animation clip for '{name}' is null!", this);
+                return;
+            }
+            
+            if (!graphInitialized)
+            {
+                Debug.LogError("[Lightning Animation] Graph not initialized!", this);
                 return;
             }
             
             if (animationCache.ContainsKey(name))
             {
-                Debug.LogWarning($"Animation '{name}' already exists! Replacing...", this);
+                DebugLog($"Animation '{name}' already exists! Replacing...");
                 RemoveAnimation(name);
             }
             
@@ -221,7 +354,6 @@ namespace LightningAnimation
         /// <summary>
         /// Remove an animation from the system
         /// </summary>
-        /// <param name="name">Name of animation to remove</param>
         public void RemoveAnimation(string name)
         {
             if (!animationCache.ContainsKey(name)) return;
@@ -231,8 +363,11 @@ namespace LightningAnimation
             // Stop if currently playing
             if (animData.isPlaying)
             {
-                StopInternal(animData);
+                StopInternal(animData, true);
             }
+            
+            // Cleanup
+            animData.Cleanup();
             
             // Dispose playable
             if (animData.clipPlayable.IsValid())
@@ -245,11 +380,12 @@ namespace LightningAnimation
         }
         
         /// <summary>
-        /// Get count of cached animations
+        /// Clear all animations
         /// </summary>
-        public int GetAnimationCount()
+        public void ClearAllAnimations()
         {
-            return animationCache.Count;
+            StopAll();
+            CleanupAllAnimations();
         }
         
         /// <summary>
@@ -267,32 +403,24 @@ namespace LightningAnimation
         #region Public API - Playback Control
         
         /// <summary>
-        /// Play animation by name
+        /// Play animation by name (stops current animation)
         /// </summary>
-        /// <param name="animationName">Name of animation to play</param>
-        /// <param name="onComplete">Optional callback when animation completes</param>
         public void Play(string animationName, Action onComplete = null)
         {
-            if (!ValidateAnimationName(animationName)) return;
-            
-            var animData = animationCache[animationName];
-            PlayInternal(animData, onComplete, 1f, 0f);
+            PlayWithMode(animationName, PlayMode.Single, onComplete);
         }
         
         /// <summary>
         /// Play animation by clip reference (auto-adds if not cached)
         /// </summary>
-        /// <param name="clip">Animation clip to play</param>
-        /// <param name="onComplete">Optional callback when animation completes</param>
         public void Play(AnimationClip clip, Action onComplete = null)
         {
             if (clip == null)
             {
-                Debug.LogWarning("Cannot play null animation clip!", this);
+                Debug.LogWarning("[Lightning Animation] Cannot play null animation clip!", this);
                 return;
             }
             
-            // Auto-add if not cached
             if (!animationCache.ContainsKey(clip.name))
             {
                 AddAnimation(clip.name, clip);
@@ -302,11 +430,48 @@ namespace LightningAnimation
         }
         
         /// <summary>
+        /// Play animation with specific mode
+        /// </summary>
+        public void PlayWithMode(string animationName, PlayMode mode, Action onComplete = null)
+        {
+            if (!ValidateAnimationName(animationName)) return;
+            
+            var animData = animationCache[animationName];
+            
+            switch (mode)
+            {
+                case PlayMode.Single:
+                    // Stop current animation first
+                    if (currentAnimation != null && currentAnimation != animData && currentAnimation.isPlaying)
+                    {
+                        StopInternal(currentAnimation, true);
+                    }
+                    PlayInternal(animData, onComplete, 1f, 0f);
+                    break;
+                    
+                case PlayMode.Additive:
+                    // Play alongside current animations
+                    PlayInternal(animData, onComplete, 1f, 0f);
+                    break;
+                    
+                case PlayMode.Queue:
+                    // Queue after current animation
+                    if (currentAnimation != null && currentAnimation.isPlaying)
+                    {
+                        animationQueue.Enqueue(new QueuedAnimation(animationName, onComplete, 0f));
+                        DebugLog($"Queued animation: {animationName}");
+                    }
+                    else
+                    {
+                        PlayInternal(animData, onComplete, 1f, 0f);
+                    }
+                    break;
+            }
+        }
+        
+        /// <summary>
         /// Play animation with crossfade transition
         /// </summary>
-        /// <param name="animationName">Name of animation to play</param>
-        /// <param name="fadeTime">Duration of crossfade in seconds</param>
-        /// <param name="onComplete">Optional callback when animation completes</param>
         public void PlayWithCrossfade(string animationName, float fadeTime = 0.3f, Action onComplete = null)
         {
             if (!ValidateAnimationName(animationName)) return;
@@ -325,15 +490,28 @@ namespace LightningAnimation
         }
         
         /// <summary>
+        /// Play animation with loop control
+        /// </summary>
+        public void PlayLooped(string animationName, int loopCount = -1, Action onComplete = null)
+        {
+            if (!ValidateAnimationName(animationName)) return;
+            
+            var animData = animationCache[animationName];
+            animData.maxLoops = loopCount;
+            animData.isLooping = true; // Force looping
+            
+            Play(animationName, onComplete);
+        }
+        
+        /// <summary>
         /// Stop specific animation
         /// </summary>
-        /// <param name="animationName">Name of animation to stop</param>
         public void Stop(string animationName)
         {
             if (!animationCache.ContainsKey(animationName)) return;
             
             var animData = animationCache[animationName];
-            StopInternal(animData);
+            StopInternal(animData, false);
         }
         
         /// <summary>
@@ -343,14 +521,15 @@ namespace LightningAnimation
         {
             for (int i = activeAnimations.Count - 1; i >= 0; i--)
             {
-                StopInternal(activeAnimations[i]);
+                StopInternal(activeAnimations[i], false);
             }
+            
+            animationQueue.Clear();
         }
         
         /// <summary>
         /// Pause specific animation
         /// </summary>
-        /// <param name="animationName">Name of animation to pause</param>
         public void Pause(string animationName)
         {
             if (!animationCache.ContainsKey(animationName)) return;
@@ -359,6 +538,7 @@ namespace LightningAnimation
             if (animData.isPlaying && !animData.isPaused)
             {
                 animData.isPaused = true;
+                animData.clipPlayable.SetSpeed(0f);
                 DebugLog($"Paused animation: {animationName}");
             }
         }
@@ -366,7 +546,6 @@ namespace LightningAnimation
         /// <summary>
         /// Resume specific animation
         /// </summary>
-        /// <param name="animationName">Name of animation to resume</param>
         public void Resume(string animationName)
         {
             if (!animationCache.ContainsKey(animationName)) return;
@@ -375,7 +554,38 @@ namespace LightningAnimation
             if (animData.isPlaying && animData.isPaused)
             {
                 animData.isPaused = false;
+                animData.clipPlayable.SetSpeed(animData.speed);
                 DebugLog($"Resumed animation: {animationName}");
+            }
+        }
+        
+        /// <summary>
+        /// Pause all animations
+        /// </summary>
+        public void PauseAll()
+        {
+            foreach (var anim in activeAnimations)
+            {
+                if (anim.isPlaying && !anim.isPaused)
+                {
+                    anim.isPaused = true;
+                    anim.clipPlayable.SetSpeed(0f);
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Resume all animations
+        /// </summary>
+        public void ResumeAll()
+        {
+            foreach (var anim in activeAnimations)
+            {
+                if (anim.isPlaying && anim.isPaused)
+                {
+                    anim.isPaused = false;
+                    anim.clipPlayable.SetSpeed(anim.speed);
+                }
             }
         }
         
@@ -386,25 +596,27 @@ namespace LightningAnimation
         /// <summary>
         /// Set playback speed for specific animation
         /// </summary>
-        /// <param name="animationName">Name of animation</param>
-        /// <param name="speed">Playback speed multiplier</param>
         public void SetSpeed(string animationName, float speed)
         {
             if (!animationCache.ContainsKey(animationName)) return;
             
             var animData = animationCache[animationName];
-            animData.clipPlayable.SetSpeed(speed);
+            animData.speed = Mathf.Max(0f, speed);
+            
+            if (!animData.isPaused)
+            {
+                animData.clipPlayable.SetSpeed(animData.speed);
+            }
         }
         
         /// <summary>
         /// Set global playback speed for all animations
         /// </summary>
-        /// <param name="speed">Global speed multiplier</param>
         public void SetGlobalSpeed(float speed)
         {
             if (playableGraph.IsValid())
             {
-                playableGraph.GetRootPlayable(0).SetSpeed(speed);
+                playableGraph.GetRootPlayable(0).SetSpeed(Mathf.Max(0f, speed));
             }
         }
         
@@ -427,7 +639,6 @@ namespace LightningAnimation
         /// <summary>
         /// Check if a specific animation is currently playing
         /// </summary>
-        /// <param name="animationName">Name of animation to check</param>
         public bool IsPlaying(string animationName)
         {
             return animationCache.ContainsKey(animationName) && 
@@ -439,7 +650,7 @@ namespace LightningAnimation
         /// </summary>
         public bool IsPlaying()
         {
-            return currentAnimation != null && currentAnimation.isPlaying;
+            return activeAnimations.Count > 0;
         }
         
         /// <summary>
@@ -453,7 +664,6 @@ namespace LightningAnimation
         /// <summary>
         /// Get the length of an animation in seconds
         /// </summary>
-        /// <param name="animationName">Name of animation</param>
         public float GetAnimationLength(string animationName)
         {
             return animationCache.ContainsKey(animationName) ? 
@@ -463,19 +673,26 @@ namespace LightningAnimation
         /// <summary>
         /// Get normalized time (0-1) of an animation
         /// </summary>
-        /// <param name="animationName">Name of animation</param>
         public float GetNormalizedTime(string animationName)
         {
             if (!animationCache.ContainsKey(animationName)) return 0f;
             
             var animData = animationCache[animationName];
-            return animData.length > 0 ? animData.currentTime / animData.length : 0f;
+            return animData.length > 0 ? (animData.currentTime % animData.length) / animData.length : 0f;
+        }
+        
+        /// <summary>
+        /// Get current time in seconds of an animation
+        /// </summary>
+        public float GetCurrentTime(string animationName)
+        {
+            if (!animationCache.ContainsKey(animationName)) return 0f;
+            return animationCache[animationName].currentTime;
         }
         
         /// <summary>
         /// Check if an animation exists in the cache
         /// </summary>
-        /// <param name="animationName">Name of animation to check</param>
         public bool HasAnimation(string animationName)
         {
             return animationCache.ContainsKey(animationName);
@@ -484,11 +701,19 @@ namespace LightningAnimation
         /// <summary>
         /// Check if animation is paused
         /// </summary>
-        /// <param name="animationName">Name of animation to check</param>
         public bool IsPaused(string animationName)
         {
             return animationCache.ContainsKey(animationName) && 
                    animationCache[animationName].isPaused;
+        }
+        
+        /// <summary>
+        /// Get current loop count of an animation
+        /// </summary>
+        public int GetLoopCount(string animationName)
+        {
+            if (!animationCache.ContainsKey(animationName)) return 0;
+            return animationCache[animationName].loopCount;
         }
         
         #endregion
@@ -499,13 +724,19 @@ namespace LightningAnimation
         {
             if (string.IsNullOrEmpty(animationName))
             {
-                Debug.LogWarning("Animation name cannot be null or empty!", this);
+                Debug.LogWarning("[Lightning Animation] Animation name cannot be null or empty!", this);
                 return false;
             }
             
             if (!animationCache.ContainsKey(animationName))
             {
-                Debug.LogWarning($"Animation '{animationName}' not found! Use AddAnimation() first.", this);
+                Debug.LogWarning($"[Lightning Animation] Animation '{animationName}' not found! Use AddAnimation() first.", this);
+                return false;
+            }
+            
+            if (!graphInitialized)
+            {
+                Debug.LogError("[Lightning Animation] Graph not initialized!", this);
                 return false;
             }
             
@@ -514,10 +745,13 @@ namespace LightningAnimation
         
         private void PlayInternal(PlayableAnimationData animData, Action onComplete, float initialWeight, float fadeTime)
         {
+            // Resume graph if paused
+            ResumeGraph();
+            
             // Stop if already playing
             if (animData.isPlaying)
             {
-                StopInternal(animData);
+                StopInternal(animData, true);
             }
             
             // Find or assign mixer slot
@@ -526,8 +760,18 @@ namespace LightningAnimation
                 animData.mixerIndex = GetAvailableMixerSlot();
                 if (animData.mixerIndex == -1)
                 {
-                    Debug.LogWarning("No available mixer slots! Consider increasing maxConcurrentAnimations.", this);
-                    return;
+                    // Try to free up a slot by stopping the oldest animation
+                    if (activeAnimations.Count >= maxConcurrentAnimations)
+                    {
+                        StopInternal(activeAnimations[0], true);
+                        animData.mixerIndex = GetAvailableMixerSlot();
+                    }
+                    
+                    if (animData.mixerIndex == -1)
+                    {
+                        Debug.LogWarning("[Lightning Animation] No available mixer slots!", this);
+                        return;
+                    }
                 }
             }
             
@@ -538,6 +782,7 @@ namespace LightningAnimation
             animData.Reset();
             animData.clipPlayable.SetTime(0);
             animData.clipPlayable.SetDone(false);
+            animData.clipPlayable.SetSpeed(animData.speed);
             animData.weight = initialWeight;
             animData.targetWeight = 1f;
             animData.isPlaying = true;
@@ -560,7 +805,7 @@ namespace LightningAnimation
         
         private void ConnectToMixer(PlayableAnimationData animData)
         {
-            if (animData.mixerIndex >= 0)
+            if (animData.mixerIndex >= 0 && animData.mixerIndex < maxConcurrentAnimations)
             {
                 // Always disconnect first, then reconnect to ensure clean state
                 DisconnectFromMixer(animData.mixerIndex);
@@ -576,16 +821,23 @@ namespace LightningAnimation
                 {
                     playableGraph.Disconnect(mixerPlayable, mixerIndex);
                 }
-                catch (System.Exception)
+                catch
                 {
                     // Ignore disconnect errors - may already be disconnected
                 }
             }
         }
         
-        private void StopInternal(PlayableAnimationData animData)
+        private void StopInternal(PlayableAnimationData animData, bool wasInterrupted)
         {
             if (!animData.isPlaying) return;
+            
+            // Fire interrupted callback if applicable
+            if (wasInterrupted && animData.onInterrupted != null)
+            {
+                animData.onInterrupted.Invoke();
+                OnAnimationInterrupted?.Invoke(animData.name);
+            }
             
             animData.isPlaying = false;
             animData.isPaused = false;
@@ -606,7 +858,29 @@ namespace LightningAnimation
                 currentAnimation = activeAnimations.Count > 0 ? activeAnimations[0] : null;
             }
             
-            DebugLog($"Stopped animation: {animData.name}");
+            // Clean up callbacks
+            animData.Cleanup();
+            
+            DebugLog($"Stopped animation: {animData.name} (Interrupted: {wasInterrupted})");
+            
+            // Process queued animations
+            ProcessQueue();
+        }
+        
+        private void ProcessQueue()
+        {
+            if (animationQueue.Count > 0 && (currentAnimation == null || !currentAnimation.isPlaying))
+            {
+                var queued = animationQueue.Dequeue();
+                if (queued.fadeTime > 0)
+                {
+                    PlayWithCrossfade(queued.name, queued.fadeTime, queued.onComplete);
+                }
+                else
+                {
+                    Play(queued.name, queued.onComplete);
+                }
+            }
         }
         
         private void FadeIn(PlayableAnimationData animData, float fadeTime)
@@ -627,6 +901,8 @@ namespace LightningAnimation
             animData.targetWeight = 0f;
             animData.blendSpeed = fadeTime > 0 ? 1f / fadeTime : float.MaxValue;
             animData.isFadingOut = true;
+            animData.onInterrupted = animData.onComplete; // Preserve callback for interrupted animation
+            animData.onComplete = null; // Clear complete callback since it's being interrupted
         }
         
         private int GetAvailableMixerSlot()
@@ -663,19 +939,49 @@ namespace LightningAnimation
                 // Update time if not paused
                 if (!animData.isPaused)
                 {
-                    animData.currentTime += deltaTime;
+                    animData.currentTime += deltaTime * animData.speed;
                     
-                    // Check for completion (non-looping animations only)
-                    if (!animData.isLooping && animData.currentTime >= animData.length)
+                    // Check for loop or completion
+                    if (animData.currentTime >= animData.length)
                     {
-                        DebugLog($"Animation completed: {animData.name}");
-                        
-                        OnAnimationEnd?.Invoke(animData.name);
-                        animData.onComplete?.Invoke();
-                        
-                        if (autoStopOnComplete)
+                        if (animData.isLooping)
                         {
-                            StopInternal(animData);
+                            // Handle looping
+                            animData.loopCount++;
+                            OnAnimationLoop?.Invoke(animData.name, animData.loopCount);
+                            
+                            // Check if we've reached max loops
+                            if (animData.maxLoops > 0 && animData.loopCount >= animData.maxLoops)
+                            {
+                                // Stop looping, finish animation
+                                DebugLog($"Animation {animData.name} completed {animData.loopCount} loops");
+                                OnAnimationEnd?.Invoke(animData.name);
+                                animData.onComplete?.Invoke();
+                                
+                                if (autoStopOnComplete)
+                                {
+                                    StopInternal(animData, false);
+                                }
+                            }
+                            else
+                            {
+                                // Continue looping
+                                animData.currentTime = animData.currentTime % animData.length;
+                                animData.clipPlayable.SetTime(animData.currentTime);
+                            }
+                        }
+                        else
+                        {
+                            // Non-looping animation completed
+                            DebugLog($"Animation completed: {animData.name}");
+                            
+                            OnAnimationEnd?.Invoke(animData.name);
+                            animData.onComplete?.Invoke();
+                            
+                            if (autoStopOnComplete)
+                            {
+                                StopInternal(animData, false);
+                            }
                         }
                     }
                 }
@@ -706,7 +1012,7 @@ namespace LightningAnimation
                     animData.isFadingOut = false;
                     if (animData.targetWeight <= 0f)
                     {
-                        StopInternal(animData);
+                        StopInternal(animData, true);
                     }
                 }
                 needsUpdate = true;
@@ -724,6 +1030,31 @@ namespace LightningAnimation
             {
                 Debug.Log($"[Lightning Animation] {message}", this);
             }
+        }
+        
+        #endregion
+        
+        #region Editor Support
+        
+        /// <summary>
+        /// Get debug information for editor display
+        /// </summary>
+        public string GetDebugInfo()
+        {
+            var info = new System.Text.StringBuilder();
+            info.AppendLine($"Active Animations: {ActiveAnimationCount}");
+            info.AppendLine($"Cached Animations: {CachedAnimationCount}");
+            info.AppendLine($"Queued Animations: {QueuedAnimationCount}");
+            info.AppendLine($"Graph Status: {(graphInitialized ? (isGraphPaused ? "Paused" : "Active") : "Not Initialized")}");
+            
+            if (currentAnimation != null)
+            {
+                info.AppendLine($"Current: {currentAnimation.name}");
+                info.AppendLine($"Progress: {GetNormalizedTime(currentAnimation.name):P}");
+                info.AppendLine($"Loop Count: {currentAnimation.loopCount}");
+            }
+            
+            return info.ToString();
         }
         
         #endregion
