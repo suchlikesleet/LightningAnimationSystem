@@ -1,0 +1,32 @@
+{
+  "name": "com.gankan.lightning-animation-system",
+  "version": "1.0.0",
+  "displayName": "Lightning Animation System",
+  "description": "High-performance animation framework built on Unity's Playables API. Provides direct control over animation playback without Animator Controller overhead, delivering superior performance and flexibility.",
+  "unity": "2019.4",
+  "keywords": [
+    "animation",
+    "playables",
+    "performance",
+    "lightweight",
+    "runtime"
+  ],
+  "author": {
+    "name": "kangkan",
+    "email": "your.email@yourcompany.com",
+    "url": "https://gankanstudio.com"
+  },
+  "dependencies": {},
+  "samples": [
+    {
+      "displayName": "Basic Usage Examples",
+      "description": "Complete examples showing how to use Lightning Animation System",
+      "path": "Samples~/BasicUsage"
+    },
+    {
+      "displayName": "Advanced Examples",
+      "description": "Advanced usage patterns and performance optimization examples",
+      "path": "Samples~/AdvancedUsage"
+    }
+  ]
+}
